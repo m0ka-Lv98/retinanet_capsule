@@ -1,0 +1,43 @@
+# dataset
+dataset:
+ image_root: "/data/unagi0/otani/dataset/capsule/capsule_crop"
+ annotation_file: "/data/unagi0/otani/endoscopy/annotations/cleanup0906/capsule_cocoformat.json"
+ split_file: "/data/unagi0/otani/endoscopy/annotations/cleanup0906/5-fold.json"
+ mean_file: "/data/unagi0/otani/endoscopy/annotations/capsule_mean.json"
+ class_integration:
+  new: [
+   {"id": 1, "name": "torose lesion"},
+   {"id": 2, "name": "vascular lesion"},
+   {"id": 3, "name": "ulcer"}
+  ]
+  map: {
+   1: 1, 2: 1, 3: 1, 4: 1, 5: 1,
+   6: 2, 7: 2,
+   8: 3
+  }
+ train: [0, 1, 2, 3]
+ val: [4]
+
+# input setting
+negative_ratio: 5
+augmentation:
+ flip: true
+ gaussnoise: 1.0
+ gamma:
+ - 0.95
+ - 1.05
+inputsize: 512
+
+# optimizer setting
+n_iteration: 50000
+batchsize: 24
+learning_rate: 0.0001
+warm_up: 200  # iteration
+lr_step:
+ - 25000
+ - 40000
+weight_decay: 0.0005
+
+# save setting
+save_dir: ./result/lr0.0001_ce_bg5_it50000_3class_4_5fold_new
+save_freq: 5000  # iteration
