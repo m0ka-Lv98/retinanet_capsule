@@ -6,6 +6,11 @@ from torchvision.ops import nms
 from retinanet.utils import BasicBlock, Bottleneck, BBoxTransform, ClipBoxes
 from retinanet.anchors import Anchors
 from retinanet import losses
+import torch.nn.functional as F
+from torch.autograd import Variable
+from .genotypes import PRIMITIVES
+from .genotypes import Genotype
+from .operations import *
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -331,3 +336,215 @@ def resnet152(num_classes, pretrained=False, **kwargs):
     if pretrained:
         model.load_state_dict(model_zoo.load_url(model_urls['resnet152'], model_dir='.'), strict=False)
     return model
+
+
+class MixedOp(nn.Module):
+
+  def __init__(self, C, stride):
+    super(MixedOp, self).__init__()
+    self._ops = nn.ModuleList()
+    for primitive in PRIMITIVES:
+      op = OPS[primitive](C, stride, False)
+      if 'pool' in primitive:
+        op = nn.Sequential(op, nn.BatchNorm2d(C, affine=False))
+      self._ops.append(op)
+
+  def forward(self, x, weights):
+    return sum(w * op(x) for w, op in zip(weights, self._ops))
+
+
+class Cell(nn.Module):
+
+  def __init__(self, steps, multiplier, C_prev_prev, C_prev, C, reduction, reduction_prev):
+    super(Cell, self).__init__()
+    self.reduction = reduction
+
+    if reduction_prev:
+      self.preprocess0 = FactorizedReduce(C_prev_prev, C, affine=False)
+    else:
+      self.preprocess0 = ReLUConvBN(C_prev_prev, C, 1, 1, 0, affine=False)
+    self.preprocess1 = ReLUConvBN(C_prev, C, 1, 1, 0, affine=False)
+    self._steps = steps
+    self._multiplier = multiplier
+
+    self._ops = nn.ModuleList()
+    self._bns = nn.ModuleList()
+    for i in range(self._steps):
+      for j in range(2+i):
+        stride = 2 if reduction and j < 2 else 1
+        op = MixedOp(C, stride)
+        self._ops.append(op)
+
+  def forward(self, s0, s1, weights):
+    s0 = self.preprocess0(s0)
+    s1 = self.preprocess1(s1)
+
+    states = [s0, s1]
+    offset = 0
+    for i in range(self._steps):
+      s = sum(self._ops[offset+j](h, weights[offset+j]) for j, h in enumerate(states))
+      offset += len(states)
+      states.append(s)
+
+    return torch.cat(states[-self._multiplier:], dim=1)
+
+class darts(nn.Module):
+    def __init__(self, num_classes, threshold=.0, tta=False, layers=4, steps=4, multiplier=4, stem_multiplier=3):
+        super(darts, self).__init__()
+        self.inplanes = 16
+        C = self.inplanes
+        self.conv1 = nn.Conv2d(3, C, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(C)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        C_curr = C
+        C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
+        self.cells = nn.ModuleList()
+        reduction_prev = False
+        reduction_channels = []
+        for i in range(layers):
+            if i in [layers//3, 2*layers//3, layers-1]:
+                C_curr *= 2
+                reduction = True
+                reduction_channels.append(multiplier*C_curr)
+            else:
+                reduction = False
+            cell = Cell(steps, multiplier, C_prev_prev, C_prev, C_curr, reduction, reduction_prev)
+            reduction_prev = reduction
+            self.cells += [cell]
+            C_prev_prev, C_prev = C_prev, multiplier*C_curr
+
+        self.fpn = PyramidFeatures(reduction_channels[0], reduction_channels[1], reduction_channels[2])
+        self.regressionModel = RegressionModel(256)
+        self.classificationModel = ClassificationModel(256, num_classes=num_classes)
+        self.anchors = Anchors()
+        self.regressBoxes = BBoxTransform()
+        self.clipBoxes = ClipBoxes()        
+        self.focalLoss = losses.FocalLoss()
+        self._C = C
+        self._num_classes = num_classes
+        self._layers = layers
+        self._steps = steps
+        self._multiplier = multiplier
+        self.tta = tta
+        self.threshold = threshold
+        self._initialize_alphas()
+
+    def freeze_bn(self):
+        '''Freeze BatchNorm layers.'''
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
+  
+    def forward(self, image, annot = None):
+        if self.training:
+            img_batch, annotations = image, annot
+        else:
+            img_batch = image
+    
+        red_res = []
+        s0 = self.conv1(img_batch)
+        s0 = self.bn1(s0)
+        s0 = self.relu(s0)
+        s0 = self.maxpool(s0)
+        s1 = s0
+
+        for i, cell in enumerate(self.cells):
+            if cell.reduction:
+                weights = F.softmax(self.alphas_reduce, dim=-1)
+            else:
+                weights = F.softmax(self.alphas_normal, dim=-1)
+      
+            s0, s1 = s1, cell(s0, s1, weights)
+            if cell.reduction:
+                red_res.append(s1)
+      
+        regression, classification = [], []  
+        features = self.fpn([red_res[0], red_res[1], red_res[2]])
+
+        regression = torch.cat([self.regressionModel(feature) for feature in features], dim=1)
+
+        classification = torch.cat([self.classificationModel(feature) for feature in features], dim=1)
+
+        anchors = self.anchors(img_batch)
+
+        if self.training:
+            return self.focalLoss(classification, regression, anchors, annotations)
+        else:
+            transformed_anchors = self.regressBoxes(anchors, regression)
+            transformed_anchors = self.clipBoxes(transformed_anchors, img_batch)
+
+            scores = torch.max(classification, dim=2, keepdim=True)[0]
+
+            scores_over_thresh = (scores > 0.05)[0, :, 0]
+
+            if scores_over_thresh.sum() == 0:
+                # no boxes to NMS, just return
+                return [torch.zeros(0), torch.zeros(0), torch.zeros(0, 4)]
+
+            classification = classification[:, scores_over_thresh, :]
+            transformed_anchors = transformed_anchors[:, scores_over_thresh, :]
+            scores = scores[:, scores_over_thresh, :]
+
+            anchors_nms_idx = nms(transformed_anchors[0,:,:], scores[0,:,0], 0.5)
+
+            nms_scores, nms_class = classification[0, anchors_nms_idx, :].max(dim=1)
+
+            return [nms_scores, nms_class, transformed_anchors[0, anchors_nms_idx, :]]
+
+    def new(self):
+        model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()
+        for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
+            x.data.copy_(y.data)
+        return model_new    
+
+    #def _loss(self, input, target):
+    #  logits = self(input)
+    #  return self._criterion(logits, target) 
+
+    def _initialize_alphas(self):
+        k = sum(1 for i in range(self._steps) for n in range(2+i))
+        num_ops = len(PRIMITIVES)
+
+        self.alphas_normal = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
+        self.alphas_reduce = Variable(1e-3*torch.randn(k, num_ops).cuda(), requires_grad=True)
+        self._arch_parameters = [
+            self.alphas_normal,
+            self.alphas_reduce,
+            ]
+
+    def arch_parameters(self):
+        return self._arch_parameters
+
+    def genotype(self):
+
+        def _parse(weights):
+            gene = []
+            n = 2
+            start = 0
+            for i in range(self._steps):
+                end = start + n
+                W = weights[start:end].copy()
+                edges = sorted(range(i + 2), key=lambda x: -max(W[x][k] for k in range(len(W[x])) if k != PRIMITIVES.index('none')))[:2]
+                for j in edges:
+                    k_best = None
+                    for k in range(len(W[j])):
+                        if k != PRIMITIVES.index('none'):
+                            if k_best is None or W[j][k] > W[j][k_best]:
+                                k_best = k
+                    gene.append((PRIMITIVES[k_best], j))
+                start = end
+                n += 1
+            return gene
+
+            
+        gene_normal = _parse(F.softmax(self.alphas_normal, dim=-1).data.cpu().numpy())
+        gene_reduce = _parse(F.softmax(self.alphas_reduce, dim=-1).data.cpu().numpy())
+
+        concat = range(2+self._steps-self._multiplier, self._steps+2)
+        genotype = Genotype(
+            normal=gene_normal, normal_concat=concat,
+            reduce=gene_reduce, reduce_concat=concat
+            )
+        return genotype

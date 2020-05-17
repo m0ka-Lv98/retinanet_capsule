@@ -69,11 +69,11 @@ def evaluate_coco(dataset, model, threshold=0.05):
             return
 
         # write output
-        json.dump(results, open('bbox_results.json', 'w'), indent=4)
+        json.dump(results, open('/data/unagi0/masaoka/retinanet/bbox_results.json', 'w'), indent=4)
 
         # load results in COCO evaluation tool
         coco_true = dataset.coco
-        coco_pred = coco_true.loadRes('bbox_results.json')
+        coco_pred = coco_true.loadRes('/data/unagi0/masaoka/retinanet/bbox_results.json')
 
         # run COCO evaluation
         coco_eval = COCOeval(coco_true, coco_pred, 'bbox')
