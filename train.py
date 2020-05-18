@@ -11,10 +11,12 @@ from retinanet import model
 from retinanet.dataloader import CocoDataset, CSVDataset, collater, Resizer, AspectRatioBasedSampler, Augmenter, \
     Normalizer
 from torch.utils.data import DataLoader
-from retinanet.utils import bbox_collate, MixedRandomSampler
+from retinanet.utils import bbox_collate, MixedRandomSampler,count_parameters_in_MB
 from retinanet import transform as transf
 from retinanet import coco_eval
 from retinanet import csv_eval
+import retinanet
+
 
 assert torch.__version__.split('.')[0] == '1'
 
@@ -32,7 +34,7 @@ def main(args=None):
     #parser.add_argument('--csv_classes', help='Path to file containing class list (see readme)')
     #parser.add_argument('--csv_val', help='Path to file containing validation annotations (optional, see readme)')
 
-    parser.add_argument('--depth', help='Resnet depth, must be one of 0, 18, 34, 50, 101, 152', type=int, default=0)
+    parser.add_argument('--depth', help='Resnet depth, must be one of 0, 1, 18, 34, 50, 101, 152', type=int, default=1)
     parser.add_argument('--epochs', help='Number of epochs', type=int, default=1)
 
     parser = parser.parse_args(args)
@@ -114,10 +116,14 @@ def main(args=None):
     dataset_val = dataset_all.split(config['dataset']['val'], config['dataset']['split_file'])
     dataset_val.set_transform(transform)
 
+    arch = 'DARTS'
     # Create the model
     if parser.depth == 0:
         retinanet = model.darts(num_classes=n_fg_class)
         opt_a = optim.Adam(retinanet.arch_parameters(),lr=3e-4, betas=(0.5, 0.999), weight_decay=1e-3)
+    elif parser.depth == 1:
+        genotype = eval(f"retinanet.genotypes.{arch}")
+        retinanet = model.Final(num_classes=n_fg_class, genotype=genotype)
     elif parser.depth == 18:
         retinanet = model.resnet18(num_classes=n_fg_class, pretrained=True)
     elif parser.depth == 34:
@@ -129,8 +135,9 @@ def main(args=None):
     elif parser.depth == 152:
         retinanet = model.resnet152(num_classes=n_fg_class, pretrained=True)
     else:
-        raise ValueError('Unsupported model depth, must be one of 0, 18, 34, 50, 101, 152')
+        raise ValueError('Unsupported model depth, must be one of 0, 1, 18, 34, 50, 101, 152')
 
+    print(f'param size = {count_parameters_in_MB(retinanet)}MB')
     use_gpu = True
 
     if use_gpu:
@@ -195,18 +202,12 @@ def main(args=None):
         
 
         print('Evaluating dataset')
-
         coco_eval.evaluate_coco(dataset_val, retinanet)
-
-
         scheduler.step(np.mean(epoch_loss))
-
-        if parser.depth != 0:
-            torch.save(retinanet.module, '/data/unagi0/masaoka/retinanet/{}_retinanet_{}.pt'.format(parser.dataset, epoch_num))
 
     retinanet.eval()
     if parser.depth != 0:
-        torch.save(retinanet, '/data/unagi0/masaoka/retinanet/model_final.pt')
+        torch.save(retinanet, f'/data/unagi0/masaoka/retinanet/model_final_{parser.depth}.pt')
     else:
         print(retinanet.module.genotype())
 

@@ -11,6 +11,7 @@ from torch.autograd import Variable
 from .genotypes import PRIMITIVES
 from .genotypes import Genotype
 from .operations import *
+from .decode import Cell_decode
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -282,7 +283,7 @@ class ResNet(nn.Module):
 
             return [nms_scores, nms_class, transformed_anchors[0, anchors_nms_idx, :]]
 
-
+dl_root = "/data/unagi0/masaoka/resnet_model_zoo/"
 def resnet18(num_classes, pretrained=False, **kwargs):
     """Constructs a ResNet-18 model.
     Args:
@@ -290,7 +291,7 @@ def resnet18(num_classes, pretrained=False, **kwargs):
     """
     model = ResNet(num_classes, BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet18'], model_dir='.'), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet18'], model_dir=dl_root), strict=False)
     return model
 
 
@@ -301,7 +302,7 @@ def resnet34(num_classes, pretrained=False, **kwargs):
     """
     model = ResNet(num_classes, BasicBlock, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet34'], model_dir='.'), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet34'], model_dir=dl_root), strict=False)
     return model
 
 
@@ -312,7 +313,7 @@ def resnet50(num_classes, pretrained=False, **kwargs):
     """
     model = ResNet(num_classes, Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet50'], model_dir='.'), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet50'], model_dir=dl_root), strict=False)
     return model
 
 
@@ -323,7 +324,7 @@ def resnet101(num_classes, pretrained=False, **kwargs):
     """
     model = ResNet(num_classes, Bottleneck, [3, 4, 23, 3], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet101'], model_dir='.'), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet101'], model_dir=dl_root), strict=False)
     return model
 
 
@@ -334,7 +335,7 @@ def resnet152(num_classes, pretrained=False, **kwargs):
     """
     model = ResNet(num_classes, Bottleneck, [3, 8, 36, 3], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet152'], model_dir='.'), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet152'], model_dir=dl_root), strict=False)
     return model
 
 
@@ -398,6 +399,7 @@ class darts(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
+        C = self.inplanes
         C_curr = C
         C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
         self.cells = nn.ModuleList()
@@ -418,6 +420,7 @@ class darts(nn.Module):
         self.fpn = PyramidFeatures(reduction_channels[0], reduction_channels[1], reduction_channels[2])
         self.regressionModel = RegressionModel(256)
         self.classificationModel = ClassificationModel(256, num_classes=num_classes)
+
         self.anchors = Anchors()
         self.regressBoxes = BBoxTransform()
         self.clipBoxes = ClipBoxes()        
@@ -493,11 +496,11 @@ class darts(nn.Module):
 
             return [nms_scores, nms_class, transformed_anchors[0, anchors_nms_idx, :]]
 
-    def new(self):
-        model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()
-        for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
-            x.data.copy_(y.data)
-        return model_new    
+    #def new(self):
+    #    model_new = Network(self._C, self._num_classes, self._layers, self._criterion).cuda()
+    #    for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
+    #        x.data.copy_(y.data)
+    #    return model_new    
 
     #def _loss(self, input, target):
     #  logits = self(input)
@@ -548,3 +551,99 @@ class darts(nn.Module):
             reduce=gene_reduce, reduce_concat=concat
             )
         return genotype
+
+class Final(nn.Module):
+    def __init__(self, num_classes, genotype, layers=9, threshold=.0):
+        super(Final, self).__init__()
+        stem_multiplier = 3
+        multiplier = 4
+        self.inplanes = 16
+        C = self.inplanes
+        self.conv1 = nn.Conv2d(3, C, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(C)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        C_curr = C
+
+        C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
+        self.cells = nn.ModuleList()
+        reduction_prev = False
+        reduction_channels = []
+        for i in range(layers):
+            if i in [layers//3, 2*layers//3, layers-1]:
+                C_curr *= 2
+                reduction = True
+                reduction_channels.append(multiplier*C_curr)
+            else:
+                reduction = False
+            cell = Cell_decode(genotype, C_prev_prev, C_prev, C_curr, reduction, reduction_prev)
+            reduction_prev = reduction
+            self.cells += [cell]
+            C_prev_prev, C_prev = C_prev, cell.multiplier*C_curr
+
+        self.fpn = PyramidFeatures(reduction_channels[0], reduction_channels[1], reduction_channels[2])
+        self.regressionModel = RegressionModel(256)
+        self.classificationModel = ClassificationModel(256, num_classes=num_classes)
+        self.anchors = Anchors()
+        self.regressBoxes = BBoxTransform()
+        self.clipBoxes = ClipBoxes()        
+        self.focalLoss = losses.FocalLoss()
+        self.threshold = threshold
+
+    def freeze_bn(self):
+        '''Freeze BatchNorm layers.'''
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
+
+    def forward(self, image, annot = None):
+        if self.training:
+            img_batch, annotations = image, annot
+        else:
+            img_batch = image
+    
+        red_res = []
+        s0 = self.conv1(img_batch)
+        s0 = self.bn1(s0)
+        s0 = self.relu(s0)
+        s0 = self.maxpool(s0)
+        s1 = s0
+
+        for i, cell in enumerate(self.cells):
+            s0, s1 = s1, cell(s0, s1)
+            if cell.reduction:
+                red_res.append(s1)
+      
+        regression, classification = [], []  
+        features = self.fpn([red_res[0], red_res[1], red_res[2]])
+
+        regression = torch.cat([self.regressionModel(feature) for feature in features], dim=1)
+
+        classification = torch.cat([self.classificationModel(feature) for feature in features], dim=1)
+
+        anchors = self.anchors(img_batch)
+
+        if self.training:
+            return self.focalLoss(classification, regression, anchors, annotations)
+        else:
+            transformed_anchors = self.regressBoxes(anchors, regression)
+            transformed_anchors = self.clipBoxes(transformed_anchors, img_batch)
+
+            scores = torch.max(classification, dim=2, keepdim=True)[0]
+
+            scores_over_thresh = (scores > 0.05)[0, :, 0]
+
+            if scores_over_thresh.sum() == 0:
+                # no boxes to NMS, just return
+                return [torch.zeros(0), torch.zeros(0), torch.zeros(0, 4)]
+
+            classification = classification[:, scores_over_thresh, :]
+            transformed_anchors = transformed_anchors[:, scores_over_thresh, :]
+            scores = scores[:, scores_over_thresh, :]
+
+            anchors_nms_idx = nms(transformed_anchors[0,:,:], scores[0,:,0], 0.5)
+
+            nms_scores, nms_class = classification[0, anchors_nms_idx, :].max(dim=1)
+
+            return [nms_scores, nms_class, transformed_anchors[0, anchors_nms_idx, :]]
